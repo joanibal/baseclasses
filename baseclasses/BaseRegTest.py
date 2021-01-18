@@ -63,8 +63,8 @@ class BaseRegTest(object):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        # self.save()
-        pass
+        if self.train:
+            self.writeRef()
 
     def getRef(self):
         return self.db
@@ -113,84 +113,103 @@ class BaseRegTest(object):
 
     # Add values from root only
     def root_add_val(self, name, values, **kwargs):
-        """Add values but only on the root proc"""
-        rtol, atol = getTol(**kwargs)
+        """
+        Add values but only on the root proc
+        """
         with multi_proc_exception_check(self.comm):
             if self.rank == 0:
-                self._add_values(name, values, rtol, atol)
+                self._add_values(name, values, **kwargs)
 
     def root_add_dict(self, name, d, **kwargs):
-        """Only write from the root proc"""
-        rtol, atol = getTol(**kwargs)
+        """
+        Only write from the root proc
+        """
         with multi_proc_exception_check(self.comm):
-
             if self.rank == 0:
-                self._add_dict(name, d, rtol, atol)
+                self._add_dict(name, d, name, **kwargs)
 
     # Add values from all processors
     def par_add_val(self, name, values, **kwargs):
-        """Add value(values) from parallel process in sorted order"""
-        rtol, atol = getTol(**kwargs)
+        """
+        Add value(values) from parallel process in sorted order
+        """
         values = self.comm.gather(values)
         with multi_proc_exception_check(self.comm):
             if self.rank == 0:
-                self._add_values(name, values, rtol, atol)
+                self._add_values(name, values, **kwargs)
 
     def par_add_sum(self, name, values, **kwargs):
-        """Add the sum of sum of the values from all processors."""
-        rtol, atol = getTol(**kwargs)
+        """
+        Add the sum of sum of the values from all processors.
+        """
         reducedSum = self.comm.reduce(numpy.sum(values))
         with multi_proc_exception_check(self.comm):
             if self.rank == 0:
-                self._add_values(name, reducedSum, rtol, atol)
+                self._add_values(name, reducedSum, **kwargs)
 
     def par_add_norm(self, name, values, **kwargs):
-        """Add the norm across values from all processors."""
-        rtol, atol = getTol(**kwargs)
+        """
+        Add the norm across values from all processors.
+        """
         reducedSum = self.comm.reduce(numpy.sum(values ** 2))
         with multi_proc_exception_check(self.comm):
             if self.rank == 0:
-                self._add_values(name, numpy.sqrt(reducedSum), rtol, atol)
+                self._add_values(name, numpy.sqrt(reducedSum), **kwargs)
 
     # *****************
     # Private functions
     # *****************
-    def assert_allclose(self, actual, reference, name, rtol, atol):
-        msg = "Failed value for: {}".format(name)
+    def assert_allclose(self, actual, reference, name, rtol, atol, full_name=None):
+        if full_name is None:
+            full_name = name
+        msg = "Failed value for: {}".format(full_name)
         numpy.testing.assert_allclose(actual, reference, rtol=rtol, atol=atol, err_msg=msg)
 
-    def _add_values(self, name, values, rtol, atol, db=None):
-        """Add values in special value format"""
-
+    def _add_values(self, name, values, db=None, **kwargs):
+        """
+        Add values in special value format
+        If compare=True, it will compare the supplied value against an existing value
+        in the database instead of adding the value, even in training mode. This is useful
+        for example in dot product tests when comparing two values.
+        """
+        rtol, atol = getTol(**kwargs)
+        compare = kwargs["compare"] if "compare" in kwargs else False
+        full_name = kwargs["full_name"] if "full_name" in kwargs else None
         if db is None:
             db = self.db
-        if self.train:
+        if not self.train or (self.train and compare):
+            self.assert_allclose(values, db[name], name, rtol, atol, full_name)
+        else:
             if name in db.keys():
                 raise ValueError(
                     "The name {} is already in the training database. Please give values UNIQUE keys.".format(name)
                 )
-            db[name] = values
-        else:
-            self.assert_allclose(values, db[name], name, rtol, atol)
+            if isinstance(values, numpy.ndarray):
+                db[name] = values.copy()
+            else:
+                db[name] = values
 
-    def _add_dict(self, dict_name, d, rtol, atol, db=None):
-        """Add all values in a dictionary in sorted key order"""
-
+    def _add_dict(self, dict_name, d, full_name, db=None, **kwargs):
+        """
+        Add all values in a dictionary in sorted key order
+        """
+        rtol, atol = getTol(**kwargs)
         if db is None:
             db = self.db
         if self.train:
             db[dict_name] = {}
         elif dict_name not in db.keys():
-            raise ValueError("The key '{}' was not found in the reference file!")
+            raise ValueError(f"The key '{dict_name}' was not found in the reference file!")
 
         for key in sorted(d.keys()):
+            full_name = f"{full_name}: {key}"
             if isinstance(d[key], bool):
-                self._add_values(key, int(d[key]), rtol, atol, db=db[dict_name])
-            if isinstance(d[key], dict):
+                self._add_values(key, int(d[key]), rtol=rtol, atol=atol, db=db[dict_name], full_name=full_name)
+            elif isinstance(d[key], dict):
                 # do some good ol' fashion recursion
-                self._add_dict(key, d[key], rtol, atol, db=db[dict_name])
+                self._add_dict(key, d[key], full_name, rtol=rtol, atol=atol, db=db[dict_name])
             else:
-                self._add_values(key, d[key], rtol, atol, db=db[dict_name])
+                self._add_values(key, d[key], rtol=rtol, atol=atol, db=db[dict_name], full_name=full_name)
 
 
 # =============================================================================
@@ -210,7 +229,10 @@ def writeRefJSON(file_name, ref):
                 else:
                     obj = numpy.ascontiguousarray(obj)
                     assert obj.flags["C_CONTIGUOUS"]
-                return dict(__ndarray__=obj.tolist(), dtype=str(obj.dtype), shape=obj.shape)
+                if obj.size == 1:
+                    return obj.item()
+                else:
+                    return dict(__ndarray__=obj.tolist(), dtype=str(obj.dtype), shape=obj.shape)
             elif isinstance(obj, numpy.integer):
                 return dict(__ndarray__=int(obj), dtype=str(obj.dtype), shape=obj.shape)
             elif isinstance(obj, numpy.floating):
